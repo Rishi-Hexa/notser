@@ -1,0 +1,25 @@
+# Environment / secrets
+.env
+# Firebase service-account credentials (never commit)
+*firebase-adminsdk*.json
+*service-account*.json
+firebase-credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+*.log
+staticfiles/
+media/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
