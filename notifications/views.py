@@ -1,7 +1,10 @@
+import logging
+
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from . import services
 from .models import Category, Delivery, Notification, Priority, Recipient, Template
@@ -12,6 +15,19 @@ from .serializers import (
     RecipientSerializer,
     TemplateSerializer,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class StatsView(APIView):
+    """Pipeline health roll-up (observability).
+
+    GET /api/v1/stats/ -> delivery/notification status counts, queue depth,
+    DLQ size, and per-channel success rate.
+    """
+
+    def get(self, request):
+        return Response(services.pipeline_stats())
 
 
 class RecipientViewSet(viewsets.ModelViewSet):
@@ -92,6 +108,10 @@ class NotificationViewSet(
         if key:
             existing = Notification.objects.filter(idempotency_key=key).first()
             if existing is not None:
+                logger.info(
+                    "idempotency hit key=%s -> returning existing notif=%s",
+                    key, existing.id,
+                )
                 return Response(
                     NotificationSerializer(existing).data, status=status.HTTP_200_OK
                 )
@@ -110,11 +130,16 @@ class NotificationViewSet(
             idempotency_key=key,
         )
         notification.recipients.set(recipients)
+        logger.info(
+            "notif=%s accepted channels=%s recipients=%d priority=%s",
+            notification.id, vd["channels"], len(recipients), notification.priority,
+        )
 
         try:
             services.enqueue_notification(notification)
         except services.NotificationConfigError as exc:
             # Nothing was queued — drop the notification and report the problem.
+            logger.error("notif=%s rejected: %s", notification.id, exc)
             notification.delete()
             raise ValidationError({"detail": str(exc)})
 

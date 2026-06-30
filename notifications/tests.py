@@ -215,6 +215,34 @@ class SchedulingTests(TestCase):
         self.assertLessEqual(delivery.next_attempt_at, timezone.now())
 
 
+class StatsTests(TestCase):
+    def test_stats_rolls_up_pipeline(self):
+        # One EMAIL that sends, one SMS that dead-letters (recipient has no phone).
+        recipient = Recipient.objects.create(name="Asha", email="asha@example.com")
+        for channel in (Channel.EMAIL, Channel.SMS):
+            n = Notification.objects.create(channels=[channel], content="c")
+            n.recipients.set([recipient])
+            services.enqueue_notification(n)
+        with mock.patch("notifications.senders.dispatch"):
+            services.process_due_deliveries()
+
+        stats = services.pipeline_stats()
+        self.assertEqual(stats["deliveries"]["SENT"], 1)
+        self.assertEqual(stats["deliveries"]["DEAD_LETTER"], 1)  # SMS, no phone
+        self.assertEqual(stats["queue"]["due_now"], 0)
+        self.assertEqual(stats["queue"]["dlq_size"], 1)
+        self.assertEqual(stats["channels"]["EMAIL"]["sent"], 1)
+        self.assertEqual(stats["channels"]["EMAIL"]["success_rate"], 1.0)
+        self.assertEqual(stats["channels"]["SMS"]["dead_letter"], 1)
+
+    def test_stats_endpoint(self):
+        resp = APIClient().get("/api/v1/stats/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("deliveries", resp.data)
+        self.assertIn("queue", resp.data)
+        self.assertIn("channels", resp.data)
+
+
 @override_settings(NOTIFS_RATE_LIMITS={"SMS": (2, 3600)})
 class RateLimitTests(TestCase):
     def test_over_limit_is_throttled_and_deferred(self):

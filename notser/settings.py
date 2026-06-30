@@ -169,3 +169,39 @@ TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")  # your Twilio n
 # FCM (Push). Path to the Firebase service-account JSON. Leave blank to keep the
 # push sender as a stub (logs only); set it to send real push via FCM.
 FCM_CREDENTIALS_FILE = os.environ.get("FCM_CREDENTIALS_FILE", "")
+
+# Pipeline logging: every stage logs to logs/notifications.log (rotating) and the
+# console, tagged with notif=<id> so one notification can be traced end-to-end
+# (grep "notif=<id>" logs/notifications.log). The notification_id is the trace id.
+LOG_DIR = BASE_DIR / "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "pipeline": {
+            "format": "{asctime} {levelname:<7} {message}",
+            "style": "{",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "pipeline"},
+        "pipeline_file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(LOG_DIR / "notifications.log"),
+            "maxBytes": 5 * 1024 * 1024,  # 5 MB
+            "backupCount": 3,
+            "formatter": "pipeline",
+        },
+    },
+    "loggers": {
+        # Captures notifications.services / .senders / .views via propagation.
+        "notifications": {
+            "handlers": ["console", "pipeline_file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}

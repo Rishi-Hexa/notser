@@ -7,15 +7,17 @@ Two halves:
     them, and on failure either schedules a retry on the backoff ladder or
     dead-letters them.
 """
+import logging
 from datetime import timedelta
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Case, IntegerField, When
+from django.db.models import Case, Count, IntegerField, When
 from django.utils import timezone
 
 from . import senders
 from .models import (
+    Channel,
     Delivery,
     DeliveryStatus,
     MissingTemplateVariable,
@@ -67,6 +69,8 @@ def _within_rate_limit(delivery):
     # A slot frees when the (count - limit)-th oldest send leaves the window.
     free_at = sent_times[len(sent_times) - limit] + timedelta(seconds=window)
     return False, max(free_at, timezone.now() + timedelta(seconds=1))
+
+logger = logging.getLogger(__name__)
 
 # Tiered retry backoff: wait 5s before retry #1, 1m before #2, 1h before #3.
 # After this many failed attempts, the delivery is dead-lettered.
@@ -161,6 +165,19 @@ def enqueue_notification(notification):
 
     Delivery.objects.bulk_create(deliveries)
     recompute_notification_status(notification.id)
+
+    dead_on_enqueue = sum(
+        1 for d in deliveries if d.status == DeliveryStatus.DEAD_LETTER
+    )
+    logger.info(
+        "notif=%s enqueued %d deliveries (channels=%s, recipients=%d)",
+        notification.id, len(deliveries), list(notification.channels), len(recipients),
+    )
+    if dead_on_enqueue:
+        logger.warning(
+            "notif=%s %d deliveries dead-lettered at enqueue (missing address)",
+            notification.id, dead_on_enqueue,
+        )
     return deliveries
 
 
@@ -240,6 +257,10 @@ def _process_one(delivery_id):
             delivery.save(
                 update_fields=["status", "next_attempt_at", "error", "updated_at"]
             )
+            logger.warning(
+                "notif=%s delivery=%s %s -> THROTTLED deferred=%s",
+                delivery.notification_id, delivery.id, delivery.channel, retry_at,
+            )
         else:
             _attempt(delivery)
 
@@ -250,27 +271,41 @@ def _process_one(delivery_id):
 def _attempt(delivery):
     """Send one delivery and record the outcome (called with the row locked)."""
     delivery.attempts += 1
+    tag = (delivery.notification_id, delivery.id, delivery.channel, delivery.attempts)
     try:
         senders.dispatch(delivery)
     except senders.PermanentDeliveryError as exc:
         delivery.status = DeliveryStatus.DEAD_LETTER
         delivery.error = f"permanent: {exc}"
         delivery.next_attempt_at = None
+        logger.warning(
+            "notif=%s delivery=%s %s -> DEAD_LETTER (permanent) attempt=%d: %s",
+            *tag, exc,
+        )
     except Exception as exc:  # TransientDeliveryError + anything unexpected
         if delivery.attempts <= len(RETRY_DELAYS):
             delay = RETRY_DELAYS[delivery.attempts - 1]
             delivery.status = DeliveryStatus.RETRYING
             delivery.next_attempt_at = timezone.now() + timedelta(seconds=delay)
             delivery.error = f"transient (attempt {delivery.attempts}): {exc}"
+            logger.warning(
+                "notif=%s delivery=%s %s -> RETRYING attempt=%d next=%s: %s",
+                *tag, delivery.next_attempt_at, exc,
+            )
         else:
             delivery.status = DeliveryStatus.DEAD_LETTER
             delivery.error = f"exhausted after {delivery.attempts} attempts: {exc}"
             delivery.next_attempt_at = None
+            logger.warning(
+                "notif=%s delivery=%s %s -> DEAD_LETTER (exhausted) attempt=%d: %s",
+                *tag, exc,
+            )
     else:
         delivery.status = DeliveryStatus.SENT
         delivery.sent_at = timezone.now()
         delivery.next_attempt_at = None
         delivery.error = ""
+        logger.info("notif=%s delivery=%s %s -> SENT attempt=%d", *tag)
 
     delivery.save(
         update_fields=[
@@ -320,6 +355,59 @@ def recompute_notification_status(notification_id):
     Notification.objects.filter(id=notification_id).update(
         status=status, updated_at=timezone.now()
     )
+
+
+def pipeline_stats():
+    """Roll up the pipeline's health for the observability endpoint.
+
+    Counts deliveries + notifications by status, queue depth (what's due now vs
+    parked for later), the DLQ size, and per-channel success rate.
+    """
+    now = timezone.now()
+
+    delivery_counts = {s: 0 for s in DeliveryStatus.values}
+    for status, n in Delivery.objects.values_list("status").annotate(n=Count("id")):
+        delivery_counts[status] = n
+
+    notification_counts = {s: 0 for s in NotificationStatus.values}
+    for status, n in Notification.objects.values_list("status").annotate(n=Count("id")):
+        notification_counts[status] = n
+
+    active = [DeliveryStatus.PENDING, DeliveryStatus.RETRYING, DeliveryStatus.THROTTLED]
+    due_now = Delivery.objects.filter(status__in=active, next_attempt_at__lte=now).count()
+    scheduled_future = Delivery.objects.filter(
+        status__in=active, next_attempt_at__gt=now
+    ).count()
+
+    by_channel = {}
+    for channel, status, n in (
+        Delivery.objects.values_list("channel", "status").annotate(n=Count("id"))
+    ):
+        by_channel.setdefault(channel, {})[status] = n
+
+    channels = {}
+    for channel in Channel.values:
+        counts = by_channel.get(channel, {})
+        sent = counts.get(DeliveryStatus.SENT, 0)
+        dead = counts.get(DeliveryStatus.DEAD_LETTER, 0)
+        terminal = sent + dead
+        channels[channel] = {
+            "total": sum(counts.values()),
+            "sent": sent,
+            "dead_letter": dead,
+            "success_rate": round(sent / terminal, 4) if terminal else None,
+        }
+
+    return {
+        "deliveries": delivery_counts,
+        "notifications": notification_counts,
+        "queue": {
+            "due_now": due_now,                  # what the worker would claim now
+            "scheduled_future": scheduled_future,  # parked (scheduled/retry/throttled)
+            "dlq_size": delivery_counts[DeliveryStatus.DEAD_LETTER],
+        },
+        "channels": channels,
+    }
 
 
 def _aggregate_status(statuses):
